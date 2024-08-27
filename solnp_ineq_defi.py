@@ -1,27 +1,13 @@
 import coptpy as cp
 import numpy as np
-from scipy.optimize import approx_fprime
+from scipy.optimize import approx_fprime, minimize_scalar
 from coptpy import COPT
 import matplotlib.pyplot as plt
+#from read_cutest_problem import get_problem_data
+from problem_definition import get_problem_data
 
-def objective_function(x):
-    return (x[0] - 2)**2 + (x[1] - 1)**2 + (x[2] - 3)**2  # 复杂目标函数
-
-def equality_constraints(x):
-    return np.array([
-        x[0] + x[1] + x[2] - 6,  # 等式约束1
-        x[0]**2 + x[1]**2 + x[2]**2 - 14  # 等式约束2
-    ])  # 等式约束，m_1=2
-
-def inequality_constraints(x):
-    return np.array([
-        x[0] - 1,  # 不等式约束1，x[0] >= 1
-        4 - x[1]  # 不等式约束2，x[1] <= 4
-    ])  # 不等式约束，m_2=2
-
-# 定义盒式约束
-l_x = np.array([0, 0, 0])  # 下界
-u_x = np.array([5, 5, 5])  # 上界
+# 获取问题数据
+objective_function, equality_constraints, inequality_constraints, l_x, u_x, p0 = get_problem_data()
 
 def augmented_lagrangian(x, y, rho, obj_func, eq_constraints):
     lagr = obj_func(x)
@@ -51,7 +37,7 @@ def jacobian_eq_constraints(x, eq_constraints):
 def find_feasible_solution(p_k, eq_constraints, l_x, u_x):
     J = jacobian_eq_constraints(p_k, eq_constraints)
     gk = eq_constraints(p_k)
-    if np.all(np.isinf(l_x)) and np.all(np.isinf(u_x)):  # 无盒式约束的情况
+    if np.all(l_x < -1e+5) and np.all(u_x > 1e+5):  # 检查 l_x < -1e+5 且 u_x > 1e+5 的情况
         p_f_k = p_k - np.linalg.pinv(J) @ gk
     else:  # 有盒式约束的情况
         env = cp.Envr()
@@ -115,6 +101,14 @@ def solve_qp_subproblem_with_copt(xi_k, H, gradient_L, J, p_f_k, p_k, l_x, u_x, 
         return x_opt, True
     else:
         return xi_k, False
+    
+def line_search(xi_k_old, xi_k, augmented_lagrangian, y, rho, obj_func, eq_constraints):
+    def F(alpha):
+        return augmented_lagrangian(alpha * xi_k_old + (1 - alpha) * xi_k, y, rho, obj_func, eq_constraints)
+    
+    result = minimize_scalar(F, bounds=(0, 1), method='bounded')
+    alpha_star = result.x
+    return alpha_star * xi_k_old + (1 - alpha_star) * xi_k
 
 def inner_iteration(p_f_k, xi_k, p_k, yk, rho, obj_func, eq_constraints, l_x, u_x, H, tol):
     n = len(p_f_k)
@@ -136,6 +130,9 @@ def inner_iteration(p_f_k, xi_k, p_k, yk, rho, obj_func, eq_constraints, l_x, u_
     else:
         return xi_k, np.zeros(m1), success
 
+def project_to_box(x, l_x, u_x):
+    return np.minimum(np.maximum(x, l_x), u_x)
+
 def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_outer_iter=100, max_inner_iter=10, tol=1e-6):
     n = len(p0)  # 变量维数
     m1 = len(eq_constraints(p0))  # 等式约束的个数
@@ -143,7 +140,11 @@ def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_o
     p0 = np.hstack((p0, np.zeros(m2)))  # 扩展 p0 以包括松弛变量
     l_x = np.hstack((l_x, np.zeros(m2)))  # 扩展 l_x 以包括松弛变量的下界
     u_x = np.hstack((u_x, np.inf * np.ones(m2)))  # 扩展 u_x 以包括松弛变量的上界
-
+    print("n=",n)
+    print("m1=",m1)
+    print("m2=",m2)
+    
+    
     rho = 1.0
     H = np.eye(n + m2)  # 初始化Hessian矩阵
     y = np.zeros(m1 + m2)  # 初始化拉格朗日乘子
@@ -205,7 +206,8 @@ def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_o
                 H = H + np.outer(t_k, t_k) / np.dot(t_k, sk) - np.dot(H, np.outer(sk, sk)).dot(H) / np.dot(sk, H.dot(sk))
 
             y = lagrange_multiplier  # 使用二次规划子问题的拉格朗日乘子作为对偶变量
-
+            xi_k = line_search(xi_k_old, xi_k, augmented_lagrangian, y, rho, obj_func, extended_eq_constraints)
+            
             print(f"Inner iteration {i+1}, xi_k: {xi_k[:n]}, infeasibility: {infeas(xi_k, extended_eq_constraints, l_x, u_x)}, lagrange multipliers: {lagrange_multiplier}")
             print(f"Hessian matrix H:\n{H}")
 
@@ -232,8 +234,7 @@ def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_o
         
         # 计算相对差值和盒式约束投影的范数
         relative_diff_values.append(abs(objective_function(xi_k[:n]) - objective_function(p_k[:n])) / max(1, abs(objective_function(p_k[:n]))))
-        box_project_norms.append(np.linalg.norm(np.minimum(np.maximum(xi_k - approx_fprime(xi_k, lambda x: augmented_lagrangian(x, y, rho, obj_func, extended_eq_constraints), np.sqrt(np.finfo(float).eps)), l_x), u_x) - xi_k))
-        
+        box_project_norms.append(np.linalg.norm(project_to_box(xi_k - approx_fprime(xi_k, lambda x: augmented_lagrangian(x, y, rho, obj_func, extended_eq_constraints), np.sqrt(np.finfo(float).eps)), l_x, u_x) - xi_k))
         #检查是否需要重启
         if (relative_diff_values[-1] <= epsilon_s and box_project_norms[-1] > epsilon_a):
             print(f"Restarting at outer iteration {k+1}")
@@ -242,7 +243,7 @@ def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_o
 
         if objective_function(xi_k[:n]) > objective_function(p_k[:n]) and v_k_new > v_k:
             print(f"Restarting due to increase in objective and infeasibility at outer iteration {k+1}")
-            y = np.zeros(m1)  # 将拉格朗日乘子设为 0
+            y = np.zeros(m1+m2)  # 将拉格朗日乘子设为 0
             H = np.diag(np.diag(H))  # 重置 Hessian 矩阵，只保留对角线元素
             continue
 
@@ -259,50 +260,48 @@ def solnp_solver(obj_func, eq_constraints, ineq_constraints, l_x, u_x, p0, max_o
 
     return p_k[:n], objective_values, infeasibilities, rhos, relative_diff_values, box_project_norms
 
-# 示例初始点
-p0 = np.array([2, 2, 2])
+if __name__ == "__main__":
+    # 运行求解器
+    solution, objective_values, infeasibilities, rhos, relative_diff_values, box_project_norms = solnp_solver(objective_function, equality_constraints, inequality_constraints, l_x, u_x, p0)
+    print("Final optimal solution:", solution)
+    print("Obj list:", objective_values)
+    print("infeas list:", infeasibilities)
+    print("rhos list:", rhos)
+    print("relative diff:", relative_diff_values)
+    print("box proj norm:", box_project_norms)
 
-# 运行求解器
-solution, objective_values, infeasibilities, rhos, relative_diff_values, box_project_norms = solnp_solver(objective_function, equality_constraints, inequality_constraints, l_x, u_x, p0)
-print("Final optimal solution:", solution)
-print(objective_values)
-print(infeasibilities)
-print(rhos)
-print(relative_diff_values)
-print(box_project_norms)
+    # 绘制目标函数值和约束违反值的变化并保存图像
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(len(objective_values)), objective_values, label='Objective Function Value')
+    plt.xlabel('Outer Iteration')
+    plt.ylabel('Objective Function Value')
+    plt.legend()
 
-# 绘制目标函数值和约束违反值的变化并保存图像
-plt.figure(figsize=(12, 6))
-plt.subplot(1, 2, 1)
-plt.plot(range(len(objective_values)), objective_values, label='Objective Function Value')
-plt.xlabel('Outer Iteration')
-plt.ylabel('Objective Function Value')
-plt.legend()
+    plt.subplot(1, 2, 2)
+    plt.plot(range(len(infeasibilities)), infeasibilities, label='Infeasibility')
+    plt.xlabel('Outer Iteration')
+    plt.ylabel('Infeasibility')
+    plt.legend()
 
-plt.subplot(1, 2, 2)
-plt.plot(range(len(infeasibilities)), infeasibilities, label='Infeasibility')
-plt.xlabel('Outer Iteration')
-plt.ylabel('Infeasibility')
-plt.legend()
+    plt.tight_layout()
+    filename = 'test_case.png'
+    plt.savefig(filename)
 
-plt.tight_layout()
-filename = 'test_case.png'
-plt.savefig(filename)
+    # 绘制相对差值和盒式约束投影的范数
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(range(len(relative_diff_values)), relative_diff_values, label='Relative Difference')
+    plt.xlabel('Outer Iteration')
+    plt.ylabel('Relative Difference')
+    plt.legend()
 
-# 绘制相对差值和盒式约束投影的范数
-plt.figure(figsize=(12, 6))
-plt.subplot(1, 2, 1)
-plt.plot(range(len(relative_diff_values)), relative_diff_values, label='Relative Difference')
-plt.xlabel('Outer Iteration')
-plt.ylabel('Relative Difference')
-plt.legend()
+    plt.subplot(1, 2, 2)
+    plt.plot(range(len(box_project_norms)), box_project_norms, label='Box Projection Norm')
+    plt.xlabel('Outer Iteration')
+    plt.ylabel('Box Projection Norm')
+    plt.legend()
 
-plt.subplot(1, 2, 2)
-plt.plot(range(len(box_project_norms)), box_project_norms, label='Box Projection Norm')
-plt.xlabel('Outer Iteration')
-plt.ylabel('Box Projection Norm')
-plt.legend()
-
-plt.tight_layout()
-filename = 'test_relative_box_norm.png'
-plt.savefig(filename)
+    plt.tight_layout()
+    filename = 'test_relative_box_norm.png'
+    plt.savefig(filename)
